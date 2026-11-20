@@ -1,202 +1,188 @@
 package main
 
 import (
+	"errors"
+	"flag"
 	"fmt"
+	"io"
+	"os"
+	"strconv"
+	"strings"
+	"unicode/utf8"
 
-	"github.com/charmbracelet/huh" // Додали бібліотеку huh
 	"github.com/compilyator/VNTU_GoLang/labs/Lab2Data/exchange"
+	"github.com/varshavskiyt-lang/currency-analyzer/analyzer"
+)
+
+const (
+	appName    = "currency-analyzer"
+	appVersion = "1.0.0"
 )
 
 func main() {
-	// Створюємо змінні використати пакети
-	var count int
-	var pair string
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
 
-	// Використовуємо пакет fmt, щоб він не зникав
-	fmt.Print("Введіть кількість значень (від 5 до 100): ")
-	fmt.Scan(&count)
-	if count < 5 || count > 100 {
-		fmt.Println("Помилка: кількість має бути від 5 до 100")
-		return
+func run(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "Помилка: не вказано підкоманду. Доступні команди: analyze, help, version.")
+		fmt.Fprintf(stderr, "Використайте '%s help' для перегляду довідки.\n", appName)
+		return 2
 	}
 
-	// --- Інтерактивне меню huh ---
-	errHuh := huh.NewForm(
-		huh.NewGroup(
-			huh.NewSelect[string]().
-				Title("Оберіть валютну пару (Стрілки Вгору/Вниз, Enter для вибору):").
-				Options(
-					huh.NewOption("Євро до Долара (EUR/USD)", "EUR/USD"),
-					huh.NewOption("Фунт до Гривні (GBP/UAH)", "GBP/UAH"),
-					huh.NewOption("Долар до Гривні (USD/UAH)", "USD/UAH"),
-					huh.NewOption("Зламати програму порожньою назвою (для тесту)", ""),
-				).
-				Value(&pair), // Вибране значення запишеться у нашу змінну pair
-		),
-	).Run()
+	switch args[0] {
+	case "help", "-h", "--help":
+		printUsage(stdout)
+		return 0
+	case "version", "-v", "--version":
+		fmt.Fprintf(stdout, "%s version %s\n", appName, appVersion)
+		return 0
+	case "analyze":
+		return runAnalyze(args[1:], stdout, stderr)
+	default:
+		fmt.Fprintf(stderr, "Помилка: невідома підкоманда %q. Використайте '%s help' для довідки.\n", args[0], appName)
+		return 2
+	}
+}
 
-	// Якщо користувач раптом скасував меню (нажав Ctrl+C)
-	if errHuh != nil {
-		fmt.Println("Помилка меню:", errHuh)
-		return
+func runAnalyze(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("analyze", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	count := fs.Int("count", 0, "Кількість значень для генерації (від 5 до 100, обов'язковий)")
+	subject := fs.String("subject", "", "Валютна пара для аналізу, наприклад EUR/USD (обов'язковий)")
+	seedRaw := fs.String("seed", "", "Необов'язкове зерно генератора (ціле число int64)")
+
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			printAnalyzeUsage(stdout)
+			return 0
+		}
+		return 2
 	}
 
-	// Використовуємо пакет exchange, щоб він теж не зникав
-	values, err := exchange.Generate(count, pair)
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "Помилка: неочікувані позиційні аргументи: %s\n", strings.Join(fs.Args(), " "))
+		return 2
+	}
+
+	trimmedSubject := strings.TrimSpace(*subject)
+	if trimmedSubject == "" {
+		fmt.Fprintln(stderr, "Помилка: обов'язковий параметр --subject не задано або він порожній.")
+		return 2
+	}
+	if utf8.RuneCountInString(trimmedSubject) > analyzer.MaxSubjectLength {
+		fmt.Fprintf(stderr, "Помилка: довжина --subject не може перевищувати %d символів.\n", analyzer.MaxSubjectLength)
+		return 2
+	}
+
+	if *count < analyzer.MinRatesCount {
+		fmt.Fprintf(stderr, "Помилка: параметр --count має бути від %d до %d (отримано %d).\n", analyzer.MinRatesCount, analyzer.MaxRatesCount, *count)
+		return 2
+	}
+	if *count > analyzer.MaxRatesCount {
+		fmt.Fprintf(stderr, "Помилка: параметр --count має бути від %d до %d (отримано %d).\n", analyzer.MinRatesCount, analyzer.MaxRatesCount, *count)
+		return 2
+	}
+
+	var (
+		seed    int64
+		hasSeed bool
+	)
+	trimmedSeed := strings.TrimSpace(*seedRaw)
+	if trimmedSeed != "" {
+		parsedSeed, err := strconv.ParseInt(trimmedSeed, 10, 64)
+		if err != nil {
+			fmt.Fprintf(stderr, "Помилка: параметр --seed має бути цілим числом int64 (отримано %q).\n", trimmedSeed)
+			return 2
+		}
+		seed = parsedSeed
+		hasSeed = true
+	}
+
+	var (
+		rates []float64
+		err   error
+	)
+	if hasSeed {
+		rates, err = exchange.GenerateWithSeed(*count, trimmedSubject, seed)
+	} else {
+		rates, err = exchange.Generate(*count, trimmedSubject)
+	}
 	if err != nil {
-		fmt.Println("Помилка:", err)
-		return
+		fmt.Fprintf(stderr, "Помилка генерації котирувань: %v\n", err)
+		return 1
 	}
 
-	fmt.Println("Отримані дані.", values)
-
-	// --- Етап 3: Обчислення ---
-	// Беремо перше згенероване число і кажемо, що воно пои що найменше і найбільше
-	min := values[0]
-	max := values[0]
-	sum := 0.0
-
-	//Запускаємо цикл: перебираємо кожен "вагончик" у нашому "потязі" (зрізі)
-	for _, v := range values {
-		//Якщо поточне число менше за наш мінімум - оновлюємо мінімум
-		if v < min {
-			min = v
-		}
-		//Якщо більше за максимум - оновлюємо максимум
-		if v > max {
-			max = v
-		}
-		//Додаємо чило до загальної суми
-		sum += v
+	series, err := analyzer.NewQuoteSeries(trimmedSubject, rates)
+	if err != nil {
+		fmt.Fprintf(stderr, "Помилка валідації серії: %v\n", err)
+		return 1
 	}
 
-	//Рахуємо серднє(ділимо суму на кількість вагончиків)
-	// len(values) - це довжина зрізу, Ми перетворюємо її на float64, бо сума теж дробова.
-	avg := sum / float64(len(values))
-
-	//Виводимо результати красиво (%.3f - означає 3 знаки після коми)
-	fmt.Printf("Мінімум: %.3f\n", min)
-	fmt.Printf("Максимум: %.3f\n", max)
-	fmt.Printf("Сума: %.3f\n", sum)
-	fmt.Printf("Середнє: %.3f\n\n", avg)
-
-	// --- Етап 4: Категоризація ---
-	// Створюємо 4 порожні "коробочки" (лічильники) для кожної категорії
-	catLow := 0      // Низький до 0.899
-	catBeLowpar := 0 // Нижче паритету 0.900 - 0.999
-	catAbovePar := 0 // Вище паритету 1.000 - 1.199
-	catHigh := 0     // Високий від 1.200
-
-	// Знову пробігаємося по всіх "вагончиках" (зрізу)
-	for _, v := range values {
-		if v < 0.900 {
-			catLow++ // "++" означає "додати 1" до лічильника
-		} else if v >= 0.900 && v < 1.000 {
-			catBeLowpar++
-		} else if v >= 1.000 && v < 1.200 {
-			catAbovePar++
-		} else { // Якщо жодна з умов вище не підійшла, число точно >= 1.200
-			catHigh++
-		}
+	report, err := series.Analyze()
+	if err != nil {
+		fmt.Fprintf(stderr, "Помилка аналізу: %v\n", err)
+		return 1
 	}
 
-	// Виводимо результати категорій на екран (%d - для цілих чисел)
-	fmt.Println("Категорії:")
-	fmt.Printf("  Низький: %d\n", catLow)
-	fmt.Printf("  Нижче паритету: %d\n", catBeLowpar)
-	fmt.Printf("  Вище паритету: %d\n", catAbovePar)
-	fmt.Printf("  Високий: %d\n\n", catHigh)
+	printReport(stdout, report, rates, hasSeed, seed)
+	return 0
+}
 
-	// --- Етап 5: Підрахунок повторів ---
-
-	// Спосіб 1: Вкладеними циклами
-	duplicatesLoop := 0
-	for i := 0; i < len(values); i++ {
-		isDuplicate := false
-		// Дивимось усі попередні "вагончики" до поточного i
-		for j := 0; j < i; j++ {
-			if values[i] == values[j] {
-				isDuplicate = true
-				break // Знайшли повтор - далі перевіряти немає сенсу
-			}
-		}
-		if isDuplicate {
-			duplicatesLoop++
-		}
-	}
-
-	// Спосіб 2: За допомогою map (словника
-	freqMap := make(map[float64]int)
-	for _, v := range values {
-		freqMap[v]++ // Рахуємо, скільки разів випало кожне число
-	}
-
-	duplicatesMap := 0
-	for _, countFreq := range freqMap {
-		if countFreq > 1 {
-			//Якщо число випало 3 рази, цу 2 повтори (3 - 1)
-			duplicatesMap += (countFreq - 1)
-		}
-	}
-
-	fmt.Printf("Кількість повторів (вкладені цикли): %d\n", duplicatesLoop)
-	fmt.Printf("Кількість повторів (через map): %d\n\n", duplicatesMap)
-
-	// --- Етап 6: Обов'язкові 0перевірки з умови завдання ---
-	fmt.Println("--- ОБОВ'ЯЗКОВІ ПЕРЕВІРКИ ---")
-
-	// Перевірка 1: Порожній рядок замість валюти має повернути помилку
-	// (Використовуємо _ замість змінної values, бо нам цікава лише наявність помилки)
-	_, errEmpty := exchange.Generate(10, "")
-	if errEmpty != nil {
-		fmt.Println("1. Порожня валюта повертає error: Успіх")
+func printReport(w io.Writer, report analyzer.AnalysisReport, rates []float64, hasSeed bool, seed int64) {
+	fmt.Fprintf(w, "=== Аналіз валютної пари %s ===\n", report.Pair)
+	if hasSeed {
+		fmt.Fprintf(w, "Кількість котирувань: %d (seed: %d)\n", report.Count, seed)
 	} else {
-		fmt.Println("1. Порожня валюта повертає error: Провал")
+		fmt.Fprintf(w, "Кількість котирувань: %d (випадкова генерація)\n", report.Count)
 	}
+	fmt.Fprintln(w, "Згенеровані значення:", formatRates(rates))
+	fmt.Fprintf(w, "Мінімум: %.3f\n", report.Min)
+	fmt.Fprintf(w, "Максимум: %.3f\n", report.Max)
+	fmt.Fprintf(w, "Сума: %.3f\n", report.Sum)
+	fmt.Fprintf(w, "Середнє: %.3f\n\n", report.Average)
 
-	//Перевірка 2: GenerateWithSeed з однвковим аргументами
-	seed1 := int64(12345)
-	seedVals1, _ := exchange.GenerateWithSeed(5, "EUR/USD", seed1)
-	seedVals2, _ := exchange.GenerateWithSeed(5, "EUR/USD", seed1)
+	fmt.Fprintln(w, "Категорії:")
+	for _, cat := range report.Categories {
+		fmt.Fprintf(w, "  %s: %d\n", cat.Name, cat.Count)
+	}
+	fmt.Fprintln(w)
 
-	// Порівнюємо два зрізи
-	isSame := true
-	for i := 0; i < len(seedVals1); i++ {
-		if seedVals1[i] != seedVals2[i] {
-			isSame = false // Якщо хоча б одне число відрізняється
+	fmt.Fprintf(w, "Кількість повторів: %d\n", report.TotalDuplicates)
+	if len(report.Repeated) > 0 {
+		for _, rep := range report.Repeated {
+			fmt.Fprintf(w, "  Курс %.3f — %d раз(и)\n", rep.Value, rep.Frequency)
 		}
 	}
-	if isSame {
-		fmt.Println("2. Однакові seed дають однакові зрізи: УСПІХ")
-	} else {
-		fmt.Println("2. Однакові seed дають однакові зрізи: ПРОВАЛ")
-	}
+	fmt.Fprintln(w)
 
-	// Перевірка 3: Зміна seed змінює послідовність
-	seed2 := int64(99999)
-	seedVals3, _ := exchange.GenerateWithSeed(5, "EUR/USD", seed2)
+	fmt.Fprintf(w, "Динаміка котирувань: [%s]\n", strings.Join(report.Trends, " "))
+}
 
-	isDifferent := false
-	for i := 0; i < len(seedVals1); i++ {
-		if seedVals1[i] != seedVals3[i] {
-			isDifferent = true // Знайшли відмінність
-		}
+func formatRates(rates []float64) string {
+	parts := make([]string, len(rates))
+	for i, v := range rates {
+		parts[i] = fmt.Sprintf("%.3f", v)
 	}
-	if isDifferent {
-		fmt.Println("3. Зміна seed змінює зріз: УСПІХ")
-	} else {
-		fmt.Println("3. Зміна seed змінює зріз: ПРОВАЛ")
-	}
+	return "[" + strings.Join(parts, " ") + "]"
+}
 
-	var trends []string
-	for i := 1; i < len(values); i++ {
-		if values[i] < values[i-1] {
-			trends = append(trends, "Нижче")
-		} else if values[i] == values[i-1] {
-			trends = append(trends, "Таке ж")
-		} else {
-			trends = append(trends, "Вище")
-		}
-	}
-	fmt.Println("Динаміка котирувань:", trends)
+func printUsage(w io.Writer) {
+	fmt.Fprintf(w, "Використання:\n  %s <підкоманда> [прапорці]\n\n", appName)
+	fmt.Fprintln(w, "Підкоманди:")
+	fmt.Fprintln(w, "  analyze   Згенерувати та проаналізувати серію котирувань валютної пари")
+	fmt.Fprintln(w, "  help      Показати цю довідку")
+	fmt.Fprintln(w, "  version   Показати версію програми")
+	fmt.Fprintln(w, "\nПриклади:")
+	fmt.Fprintf(w, "  %s analyze --count 10 --subject \"EUR/USD\"\n", appName)
+	fmt.Fprintf(w, "  %s analyze --count 5 --subject \"EUR/USD\" --seed 12345\n", appName)
+}
+
+func printAnalyzeUsage(w io.Writer) {
+	fmt.Fprintf(w, "Використання:\n  %s analyze --count <5..100> --subject <пара> [--seed <int64>]\n\n", appName)
+	fmt.Fprintln(w, "Прапорці:")
+	fmt.Fprintln(w, "  --count     Кількість значень для генерації від 5 до 100 (обов'язковий)")
+	fmt.Fprintln(w, "  --subject   Назва валютної пари, наприклад EUR/USD (обов'язковий)")
+	fmt.Fprintln(w, "  --seed      Ціле число int64 для відтворюваної генерації (необов'язковий)")
 }
